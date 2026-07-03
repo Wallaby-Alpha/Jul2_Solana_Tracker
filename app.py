@@ -766,15 +766,20 @@ def score_label(score: float) -> str:
 
 
 # ── Sell-Through Cohorts helpers ──────────────────────────────────────────────
-def fetch_first_deployment_time(mint: str, helius_url: str, max_pages: int = 20):
+def fetch_first_deployment_time(mint: str, helius_url: str, max_pages: int = 100):
     """
     Walk getSignaturesForAddress backwards on the mint account itself to find
-    its earliest transaction (creation/deploy). Returns a unix blockTime or None.
-    max_pages caps how far back we page (each page = up to 1000 sigs) to avoid
-    runaway scans on mints with unusually high direct-touch activity.
+    its earliest transaction (creation/deploy). Returns (blockTime, hit_cap).
+
+    hit_cap=True means we exhausted max_pages before reaching the true start of
+    the mint's history — the returned blockTime is NOT reliably the deploy time,
+    it's just the oldest signature we happened to page back to. Tokens with a
+    lot of trading volume can easily exceed max_pages * 1000 signatures, so this
+    must be surfaced to the caller rather than silently treated as ground truth.
     """
     before = None
     last_page = []
+    hit_cap = True
     for _ in range(max_pages):
         params = [mint, {"limit": 1000}]
         if before:
@@ -791,14 +796,16 @@ def fetch_first_deployment_time(mint: str, helius_url: str, max_pages: int = 20)
         except Exception:
             break
         if not page:
+            hit_cap = False
             break
         last_page = page
         if len(page) < 1000:
+            hit_cap = False
             break
         before = page[-1]["signature"]
     if not last_page:
-        return None
-    return last_page[-1].get("blockTime")
+        return None, False
+    return last_page[-1].get("blockTime"), hit_cap
 
 
 def fetch_signatures_paginated(wallet: str, helius_url: str, cutoff_ts: int,
@@ -1864,8 +1871,15 @@ with tab7:
         )
     with col7b:
         t7_max_sigs = st.slider(
-            "Max signatures scanned per wallet", 100, 1000, 300, 50,
+            "Max signatures scanned per wallet", 100, 5000, 1000, 100,
             key="t7_max_sigs",
+            help=(
+                "The scan pages backward from now toward the deploy window. If a wallet has "
+                "traded more than this many times since deploy, older transactions (including "
+                "the original acquisition) won't be seen and it may look like it received "
+                "nothing. Raise this if you see wallets flagged '⚠️ Sig cap hit' or if results "
+                "look implausibly empty — at the cost of a slower scan."
+            ),
         )
         t7_max_workers = st.slider(
             "Parallel Wallet Scanners (Rate limit tuning)", 1, 10, 4, 1,
@@ -1899,7 +1913,29 @@ with tab7:
             st.stop()
 
         with st.spinner("Finding deployment time..."):
-            deploy_ts = fetch_first_deployment_time(mint7, HELIUS_URL)
+            deploy_ts, deploy_hit_cap = fetch_first_deployment_time(mint7, HELIUS_URL)
+
+        if deploy_hit_cap:
+            st.warning(
+                "⚠️ This mint has very high transaction volume — the automatic deploy-time "
+                "lookup hit its scan cap before reaching the token's true first transaction. "
+                "The detected time below is likely **later** than the actual deploy, which "
+                "means early holders may be missed. If you know the real deploy time, enter "
+                "it manually below."
+            )
+            manual_override = st.text_input(
+                "Manual deploy time override (UTC, format: YYYY-MM-DD HH:MM)",
+                key="t7_manual_deploy",
+                placeholder="e.g. 2026-06-15 14:30",
+            )
+            if manual_override.strip():
+                try:
+                    manual_dt = datetime.strptime(manual_override.strip(), "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
+                    deploy_ts = int(manual_dt.timestamp())
+                    st.success(f"Using manual deploy time: {manual_override.strip()} UTC")
+                except ValueError:
+                    st.error("Couldn't parse that timestamp — expected format YYYY-MM-DD HH:MM (UTC). Falling back to the auto-detected time.")
+
         if not deploy_ts:
             st.error("Couldn't determine deployment time for this mint.")
             st.stop()
@@ -1976,11 +2012,22 @@ with tab7:
 
         if capped_wallets7:
             st.warning(
-                f"⚠️ {len(capped_wallets7)} wallet(s) hit the signature cap early. totals may be truncated."
+                f"⚠️ {len(capped_wallets7)} wallet(s) hit the signature cap before reaching the "
+                f"deploy-window cutoff — their totals are likely truncated (received/sold may be "
+                f"undercounted, including possibly to zero). Raise 'Max signatures scanned per "
+                f"wallet' above to fix this."
             )
 
         if not results7:
-            st.warning(f"No wallets received ≥{t7_min_pct}% of supply post-cutoff. Try a lower constraint threshold.")
+            if capped_wallets7:
+                st.warning(
+                    f"No wallets received ≥{t7_min_pct}% of supply post-cutoff — but "
+                    f"{len(capped_wallets7)} wallet(s) hit the signature cap, so this is likely "
+                    f"an undercount rather than a true zero. Raise 'Max signatures scanned per "
+                    f"wallet' and re-run before trusting this result."
+                )
+            else:
+                st.warning(f"No wallets received ≥{t7_min_pct}% of supply post-cutoff. Try a lower constraint threshold, or double-check the deploy time above is accurate.")
             st.stop()
 
         # Cohort summary maps
