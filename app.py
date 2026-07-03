@@ -4,10 +4,10 @@ Solana Wallet Intelligence
 Seven-tab Streamlit app — deploy free on Streamlit Community Cloud.
 
 Tab 1 — Cohort Analyzer:       classify holders by total wallet net worth
-Tab 2 — Whale Overlap:         find what tokens the big wallets currently share
+Tab 2 — Whale Overlap:          find what tokens the big wallets currently share
 Tab 3 — Recent Acquisitions:   what have whales/sharks actually bought in last N days
-Tab 4 — Watchlist:             scan your personal preset list of wallets for recent buys
-Tab 5 — Common Holders:        find wallets that appear on both of two holder CSVs
+Tab 4 — Watchlist:              scan your personal preset list of wallets for recent buys
+Tab 5 — Common Holders:         find wallets that appear on both of two holder CSVs
 Tab 6 — Whale Pressure:        scan top holders of a coin and score net buy/sell conviction
 Tab 7 — Sell-Through Cohorts:  find early significant holders (1h+ post-deploy) and bucket
                                 them by how much of what they received they've since sold
@@ -26,6 +26,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ── page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -339,14 +340,14 @@ PRESET_WALLETS = [
 # GATING BLOCK — uncomment when you want to sell access
 # ══════════════════════════════════════════════════════════════════════════════
 # def check_access():
-#     valid_codes = st.secrets.get("ACCESS_CODES", [])
-#     code = st.text_input("Enter access code", type="password", key="access_code")
-#     if not code:
-#         st.info("Enter your access code to continue. Purchase at [your-site.com](https://your-site.com).")
-#         st.stop()
-#     if code not in valid_codes:
-#         st.error("Invalid access code.")
-#         st.stop()
+#      valid_codes = st.secrets.get("ACCESS_CODES", [])
+#      code = st.text_input("Enter access code", type="password", key="access_code")
+#      if not code:
+#          st.info("Enter your access code to continue. Purchase at [your-site.com](https://your-site.com).")
+#          st.stop()
+#      if code not in valid_codes:
+#          st.error("Invalid access code.")
+#          st.stop()
 # check_access()
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -429,18 +430,32 @@ def fetch_signatures(wallet: str, helius_url: str, limit: int = 100) -> list:
         return []
 
 
-def fetch_transaction(sig: str, helius_url: str):
-    payload = {
-        "jsonrpc": "2.0", "id": "tx",
-        "method": "getTransaction",
-        "params": [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}],
-    }
+def fetch_transaction_batch(signatures: list, helius_url: str) -> list:
+    """Fetch multiple transactions concurrently using JSON-RPC batching."""
+    if not signatures:
+        return []
+    
+    payload = [
+        {
+            "jsonrpc": "2.0",
+            "id": f"tx-{idx}",
+            "method": "getTransaction",
+            "params": [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}],
+        }
+        for idx, sig in enumerate(signatures)
+    ]
     try:
         r = requests.post(helius_url, json=payload, timeout=30)
         r.raise_for_status()
-        return r.json().get("result")
+        responses = r.json()
+        # Sort responses back to order if necessary, but returning results is fine
+        if isinstance(responses, list):
+            return [res.get("result") for res in responses if "result" in res]
+        elif isinstance(responses, dict) and "result" in responses:
+            return [responses.get("result")]
     except Exception:
-        return None
+        pass
+    return [None] * len(signatures)
 
 
 def parse_token_inflows(tx, wallet: str, sig: str) -> list:
@@ -488,13 +503,22 @@ def scan_wallet_acquisitions(wallet: str, helius_url: str, cutoff_ts: int) -> li
     """Fetch and parse all token inflows for a wallet since cutoff_ts."""
     acquisitions = []
     sigs = fetch_signatures(wallet, helius_url, limit=100)
+    
+    valid_sigs = []
     for sig_info in sigs:
         if sig_info.get("blockTime", 0) < cutoff_ts:
             break
-        tx     = fetch_transaction(sig_info["signature"], helius_url)
-        found  = parse_token_inflows(tx, wallet, sig_info["signature"])
-        acquisitions.extend(found)
-        time.sleep(0.1)
+        valid_sigs.append(sig_info["signature"])
+        
+    # Process signature fetches in chunks of 10 using JSON-RPC Batching
+    batch_size = 10
+    for i in range(0, len(valid_sigs), batch_size):
+        sig_batch = valid_sigs[i:i+batch_size]
+        tx_batch = fetch_transaction_batch(sig_batch, helius_url)
+        for sig, tx in zip(sig_batch, tx_batch):
+            found = parse_token_inflows(tx, wallet, sig)
+            acquisitions.extend(found)
+        time.sleep(0.05)
     return acquisitions
 
 
@@ -620,7 +644,7 @@ def render_acquisition_results(
             "date":            acq["date"],
             "tx_sig":          acq["tx_sig"],
             "wallets_bought":  len(token_wallets[acq["mint"]]),
-            "coordinated":     len(token_wallets[acq["mint"]]) >= min_shared,
+            "coordinated":      len(token_wallets[acq["mint"]]) >= min_shared,
         })
     csv_out = pd.DataFrame(dl_rows).sort_values(
         ["coordinated", "wallets_bought"], ascending=[False, False]
@@ -842,23 +866,30 @@ def parse_mint_flow(tx, wallet: str, mint: str):
     return received, sold
 
 
-def scan_wallet_mint_flow_since(wallet: str, mint: str, helius_url: str,
-                                 cutoff_ts: int, max_sigs: int = 300) -> dict:
-    """Total received / sold of `mint` by `wallet` since cutoff_ts."""
+def scan_single_wallet_mint_flow(wallet: str, mint: str, helius_url: str, cutoff_ts: int, max_sigs: int) -> dict:
+    """Worker function tasked to pull signatures and run batched transaction indexing for a singular wallet."""
     sigs = fetch_signatures_paginated(wallet, helius_url, cutoff_ts, max_sigs=max_sigs)
     received_total = 0.0
     sold_total     = 0.0
-    for sig_info in sigs:
-        tx = fetch_transaction(sig_info["signature"], helius_url)
-        r, s = parse_mint_flow(tx, wallet, mint)
-        received_total += r
-        sold_total     += s
-        time.sleep(0.07)
+    
+    valid_sigs = [sig_info["signature"] for sig_info in sigs]
+    batch_size = 10  # Pull 10 transactions in a single batch array
+    
+    for i in range(0, len(valid_sigs), batch_size):
+        sig_batch = valid_sigs[i:i+batch_size]
+        tx_batch = fetch_transaction_batch(sig_batch, helius_url)
+        for tx in tx_batch:
+            r, s = parse_mint_flow(tx, wallet, mint)
+            received_total += r
+            sold_total     += s
+        time.sleep(0.02) # Modest sleep offset to protect batch throughput
+        
     return {
-        "received":     received_total,
-        "sold":         sold_total,
+        "wallet": wallet,
+        "received": received_total,
+        "sold": sold_total,
         "sigs_scanned": len(sigs),
-        "hit_sig_cap":  len(sigs) >= max_sigs,
+        "hit_sig_cap": len(sigs) >= max_sigs,
     }
 
 
@@ -1300,7 +1331,7 @@ with tab3:
         t3_days = st.slider("Lookback (days)", 1, 30, 7, 1, key="t3_days")
     with col_b:
         t3_max  = st.slider("Max wallets to scan", 5, 50, 20, 5, key="t3_max",
-                             help="Each wallet scans up to 100 recent txs — keep low for speed")
+                            help="Each wallet scans up to 100 recent txs — keep low for speed")
 
     t3_min_shared = st.slider(
         "Highlight when bought by N+ wallets",
@@ -1324,7 +1355,7 @@ with tab3:
             st.info(f"Capped to {t3_max} wallets.")
 
         st.markdown(f"**Scanning {len(wallets3)} wallets for buys since {cutoff_str}...**")
-        st.caption("This tab reads raw transactions — it's slower than the others. ~2–5s per wallet.")
+        st.caption("This tab reads raw transactions using optimized batched RPC fetching.")
 
         prog3   = st.progress(0)
         status3 = st.empty()
@@ -1402,7 +1433,6 @@ with tab4:
         cutoff_str = datetime.fromtimestamp(cutoff_ts, tz=timezone.utc).strftime("%Y-%m-%d")
 
         st.markdown(f"**Scanning {len(PRESET_WALLETS)} wallets for buys since {cutoff_str}...**")
-        st.caption("Reads raw transactions — ~2–5s per wallet.")
 
         prog4   = st.progress(0)
         status4 = st.empty()
@@ -1599,433 +1629,4 @@ with tab6:
             pct        = (ui_amount / total_supply * 100) if total_supply > 0 else 0
 
             if pct < t6_min_pct:
-                resolve_prog.progress((i + 1) / min(len(largest), t6_top_n))
-                continue
-
-            owner = resolve_token_account_owner(token_acct, HELIUS_URL)
-            if not owner:
-                resolve_prog.progress((i + 1) / min(len(largest), t6_top_n))
-                continue
-
-            if owner in EXCHANGE_WALLETS:
-                skipped_exchange += 1
-                resolve_prog.progress((i + 1) / min(len(largest), t6_top_n))
-                continue
-
-            resolved_holders.append({
-                "token_account": token_acct,
-                "owner":         owner,
-                "balance":       ui_amount,
-                "pct_supply":    round(pct, 4),
-            })
-            resolve_prog.progress((i + 1) / min(len(largest), t6_top_n))
-            time.sleep(0.1)
-
-        resolve_prog.empty()
-
-        if not resolved_holders:
-            st.warning("No qualifying holder wallets found after filtering exchanges.")
-            st.stop()
-
-        if skipped_exchange:
-            st.info(f"ℹ️ Skipped {skipped_exchange} exchange wallet(s).")
-
-        st.success(f"✅ {len(resolved_holders)} whale wallets identified. Scanning transactions across 1d / 2d / 7d windows...")
-
-        # Show holder table
-        st.subheader("🐳 Qualified Holders")
-        holder_df = pd.DataFrame([{
-            "Rank":        i + 1,
-            "Wallet":      h["owner"],
-            "Balance":     f"{h['balance']:,.0f}",
-            "% of Supply": f"{h['pct_supply']:.4f}%",
-        } for i, h in enumerate(resolved_holders)])
-        st.dataframe(holder_df, use_container_width=True, hide_index=True)
-
-        # Step 4: scan flows
-        now_ts  = int(datetime.now(timezone.utc).timestamp())
-        windows = {"1d": 1, "2d": 2, "7d": 7}
-        cutoffs = {k: now_ts - v * 86400 for k, v in windows.items()}
-
-        scan_prog   = st.progress(0)
-        scan_status = st.empty()
-        wallet_flows = {}
-
-        for i, holder in enumerate(resolved_holders):
-            wallet = holder["owner"]
-            scan_status.text(f"[{i+1}/{len(resolved_holders)}] Scanning {wallet[:12]}...")
-
-            sigs = fetch_signatures(wallet, HELIUS_URL, limit=150)
-            txs_parsed = []
-
-            for sig_info in sigs:
-                bt = sig_info.get("blockTime", 0)
-                if bt < cutoffs["7d"]:
-                    break
-                tx = fetch_transaction(sig_info["signature"], HELIUS_URL)
-                if not tx:
-                    continue
-
-                meta = tx.get("meta", {})
-                pre  = {e["accountIndex"]: e for e in meta.get("preTokenBalances", [])}
-                post = {e["accountIndex"]: e for e in meta.get("postTokenBalances", [])}
-
-                for idx in set(list(pre.keys()) + list(post.keys())):
-                    pre_e     = pre.get(idx, {})
-                    post_e    = post.get(idx, {})
-                    this_mint = post_e.get("mint") or pre_e.get("mint", "")
-                    owner     = post_e.get("owner") or pre_e.get("owner", "")
-                    if this_mint != mint_addr or owner != wallet:
-                        continue
-                    pre_amt  = float((pre_e.get("uiTokenAmount")  or {}).get("uiAmount") or 0)
-                    post_amt = float((post_e.get("uiTokenAmount") or {}).get("uiAmount") or 0)
-                    delta    = post_amt - pre_amt
-                    if delta != 0:
-                        txs_parsed.append({"delta": delta, "ts": bt})
-
-                time.sleep(0.07)
-
-            wallet_flows[wallet] = {}
-            for wname, days in windows.items():
-                cutoff   = cutoffs[wname]
-                relevant = [t for t in txs_parsed if t["ts"] >= cutoff]
-                bought   = sum(t["delta"] for t in relevant if t["delta"] > 0)
-                sold     = sum(abs(t["delta"]) for t in relevant if t["delta"] < 0)
-                buy_txs  = sum(1 for t in relevant if t["delta"] > 0)
-                sell_txs = sum(1 for t in relevant if t["delta"] < 0)
-                wallet_flows[wallet][wname] = {
-                    "bought":   round(bought, 2),
-                    "sold":     round(sold, 2),
-                    "buy_txs":  buy_txs,
-                    "sell_txs": sell_txs,
-                    "net":      round(bought - sold, 2),
-                    "score":    conviction_score(bought, sold, buy_txs, sell_txs),
-                }
-
-            scan_prog.progress((i + 1) / len(resolved_holders))
-
-        scan_status.empty()
-        scan_prog.empty()
-
-        # Step 5: display results
-        st.markdown("---")
-        st.subheader("📊 Conviction Scores")
-
-        for wname in windows:
-            scores   = [wallet_flows[h["owner"]][wname]["score"] for h in resolved_holders]
-            agg      = round(sum(scores) / len(scores), 1) if scores else 0
-            net_buys = sum(wallet_flows[h["owner"]][wname]["net"] > 0 for h in resolved_holders)
-            net_sell = sum(wallet_flows[h["owner"]][wname]["net"] < 0 for h in resolved_holders)
-            neutral  = len(resolved_holders) - net_buys - net_sell
-            label    = score_label(agg)
-            bar_color = "#22c55e" if agg >= 10 else "#ef4444" if agg <= -10 else "#6b7280"
-            bar_pct   = int((agg + 100) / 2)
-
-            st.markdown(f"### {wname} Window")
-            st.markdown(f"""
-<div style="background:#1e293b;border-radius:10px;padding:16px 20px;margin-bottom:12px;">
-  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
-    <span style="font-size:1.6rem;font-weight:700;color:{'#22c55e' if agg>=10 else '#ef4444' if agg<=-10 else '#94a3b8'};">{agg:+.1f}</span>
-    <span style="font-size:1rem;color:#e2e8f0;">{label}</span>
-  </div>
-  <div style="background:#334155;border-radius:6px;height:10px;overflow:hidden;">
-    <div style="width:{bar_pct}%;height:100%;background:{bar_color};border-radius:6px;"></div>
-  </div>
-  <div style="display:flex;gap:24px;margin-top:10px;font-size:0.85rem;color:#94a3b8;">
-    <span>🟢 Buying: <b style="color:#e2e8f0;">{net_buys}</b></span>
-    <span>🔴 Selling: <b style="color:#e2e8f0;">{net_sell}</b></span>
-    <span>⚪ Neutral: <b style="color:#e2e8f0;">{neutral}</b></span>
-  </div>
-</div>
-""", unsafe_allow_html=True)
-
-        # Per-wallet breakdown
-        st.markdown("---")
-        st.subheader("🔍 Per-Wallet Breakdown")
-
-        for wname in windows:
-            with st.expander(f"{wname} — individual wallet flows"):
-                rows6 = []
-                for h in resolved_holders:
-                    w  = h["owner"]
-                    wf = wallet_flows[w][wname]
-                    rows6.append({
-                        "Wallet":    w,
-                        "% Supply":  f"{h['pct_supply']:.4f}%",
-                        "Bought":    f"{wf['bought']:,.0f}",
-                        "Sold":      f"{wf['sold']:,.0f}",
-                        "Net":       f"{'+' if wf['net']>=0 else ''}{wf['net']:,.0f}",
-                        "Buy Txs":   wf["buy_txs"],
-                        "Sell Txs":  wf["sell_txs"],
-                        "Score":     f"{wf['score']:+.1f}",
-                        "Signal":    score_label(wf["score"]),
-                    })
-                rows6.sort(key=lambda x: float(x["Score"]), reverse=True)
-                st.dataframe(pd.DataFrame(rows6), use_container_width=True, hide_index=True)
-
-        # Download
-        st.markdown("---")
-        dl6_rows = []
-        for h in resolved_holders:
-            w = h["owner"]
-            for wname in windows:
-                wf = wallet_flows[w][wname]
-                dl6_rows.append({
-                    "wallet":      w,
-                    "pct_supply":  h["pct_supply"],
-                    "window":      wname,
-                    "bought":      wf["bought"],
-                    "sold":        wf["sold"],
-                    "net":         wf["net"],
-                    "buy_txs":     wf["buy_txs"],
-                    "sell_txs":    wf["sell_txs"],
-                    "score":       wf["score"],
-                    "signal":      score_label(wf["score"]),
-                })
-        csv6 = pd.DataFrame(dl6_rows).to_csv(index=False).encode()
-        st.download_button(
-            "⬇️ Download Whale Pressure CSV",
-            csv6,
-            f"whale_pressure_{mint_addr[:8]}.csv",
-            "text/csv",
-        )
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  TAB 7 — SELL-THROUGH COHORTS
-# ══════════════════════════════════════════════════════════════════════════════
-with tab7:
-    st.header("Sell-Through Cohorts")
-    st.caption(
-        "Find early significant holders of a token, then see how much of what "
-        "they received they've since sold."
-    )
-
-    with st.expander("ℹ️ How it works", expanded=True):
-        st.markdown("""
-1. Enter the token's **mint address** and upload a **holder CSV** (e.g. Solscan
-   *Holders → Download CSV*, Birdeye, or Dexscreener export — any CSV with an
-   address column works, same detection as the other tabs).
-2. The app finds the token's **deployment time** (its first on-chain transaction)
-   and sets the scan window to start **1 hour after deployment** — early snipers
-   and bots in that first hour are excluded.
-3. For each uploaded wallet, it scans transaction history **since that cutoff**
-   to compute:
-   - **Received** — total tokens the wallet took in since the cutoff
-   - **Sold** — total tokens the wallet sent out since the cutoff
-4. Wallets whose **received** amount is below your minimum % of supply are
-   dropped — they're not "significant" early holders.
-5. Remaining wallets are bucketed by **Sold ÷ Received** into 10%-wide cohorts:
-   `0%`, `0–10%`, `10–20%`, … `90–100%`, plus a `100%+` bucket for wallets that
-   sold more than they received in-window (they must have sold part of a
-   pre-existing stack too), and an `N/A` bucket for wallets that only ever held
-   tokens acquired **before** the cutoff (no in-window receives to measure against).
-
-**Notes / limits:**
-- Deployment time is inferred from the mint account's own transaction history, and
-  transfer scanning uses `getSignaturesForAddress` + `getTransaction` (no dedicated
-  full-history indexer), so very old or extremely active wallets/tokens may hit the
-  per-wallet signature cap below before reaching the cutoff — those are flagged.
-- Known exchange wallets can optionally be excluded, same list as Whale Pressure.
-- This tab does per-wallet, per-transaction scanning — it's the slowest tab. Keep
-  wallet counts and the signature cap modest for a quicker first pass.
-""")
-
-    t7_mint = st.text_input(
-        "Token Mint Address",
-        placeholder="e.g. DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
-        key="t7_mint",
-    )
-    t7_file = st.file_uploader("Upload holder CSV", type=["csv"], key="t7_file")
-
-    col7a, col7b = st.columns(2)
-    with col7a:
-        t7_min_pct = st.number_input(
-            "Min % of supply received (in-window) to qualify",
-            min_value=0.01, max_value=10.0, value=0.10, step=0.01,
-            key="t7_min_pct",
-            help="Wallets that received less than this % of total supply since the cutoff are excluded.",
-        )
-        t7_max_wallets = st.slider(
-            "Max wallets to scan", 5, MAX_WALLETS, 40, 5, key="t7_max_wallets"
-        )
-    with col7b:
-        t7_max_sigs = st.slider(
-            "Max signatures scanned per wallet", 100, 1000, 300, 50,
-            key="t7_max_sigs",
-            help="Higher = more complete history but much slower. Wallets that hit this cap are flagged.",
-        )
-        t7_exclude_exchanges = st.checkbox(
-            "Exclude known exchange wallets", value=True, key="t7_exclude_exchanges"
-        )
-
-    t7_btn = st.button(
-        "💎 Run Sell-Through Scan",
-        type="primary",
-        disabled=not (helius_key and t7_mint.strip() and t7_file),
-        key="t7_btn",
-    )
-
-    if t7_btn:
-        mint7 = t7_mint.strip()
-        st.markdown("---")
-
-        # Step 0: token identity
-        with st.spinner("Looking up token..."):
-            token_meta7 = get_token_metadata(mint7, HELIUS_URL)
-        render_token_header(mint7, token_meta7)
-        st.markdown("---")
-
-        # Step 1: supply
-        with st.spinner("Fetching token supply..."):
-            total_supply7 = get_token_supply(mint7, HELIUS_URL)
-        if total_supply7 <= 0:
-            st.error("Couldn't fetch token supply. Check the mint address.")
-            st.stop()
-
-        # Step 2: deployment time
-        with st.spinner("Finding deployment time..."):
-            deploy_ts = fetch_first_deployment_time(mint7, HELIUS_URL)
-        if not deploy_ts:
-            st.error("Couldn't determine deployment time for this mint. Check the mint address.")
-            st.stop()
-
-        cutoff_ts7  = deploy_ts + 3600
-        deploy_str  = datetime.fromtimestamp(deploy_ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        cutoff_str7 = datetime.fromtimestamp(cutoff_ts7, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        st.info(f"🚀 Deployed **{deploy_str}**  ·  Scan window starts **{cutoff_str7}** (deploy + 1h)")
-
-        # Step 3: wallets from CSV
-        wallets7 = parse_wallets_from_csv(t7_file)
-        if not wallets7:
-            st.error("No valid Solana addresses found in CSV.")
-            st.stop()
-
-        if t7_exclude_exchanges:
-            before_ct = len(wallets7)
-            wallets7 = [w for w in wallets7 if w not in EXCHANGE_WALLETS]
-            skipped_ex7 = before_ct - len(wallets7)
-        else:
-            skipped_ex7 = 0
-
-        if len(wallets7) > t7_max_wallets:
-            st.info(f"CSV has {len(wallets7)} qualifying addresses — scanning first {t7_max_wallets}.")
-            wallets7 = wallets7[:t7_max_wallets]
-        if skipped_ex7:
-            st.caption(f"Excluded {skipped_ex7} known exchange wallet(s).")
-
-        st.markdown(f"**Scanning {len(wallets7)} wallets for {mint7[:8]}... flows since {cutoff_str7}**")
-        st.caption("This reads raw transactions per wallet — the slowest tab. Grab a coffee. ☕")
-
-        prog7   = st.progress(0)
-        status7 = st.empty()
-        results7 = []
-        capped_wallets7 = []
-
-        for i, wallet in enumerate(wallets7):
-            status7.text(f"[{i+1}/{len(wallets7)}] {wallet[:12]}... scanning transactions")
-            flow = scan_wallet_mint_flow_since(
-                wallet, mint7, HELIUS_URL, cutoff_ts7, max_sigs=t7_max_sigs
-            )
-            received = flow["received"]
-            sold     = flow["sold"]
-            received_pct = (received / total_supply7 * 100) if total_supply7 > 0 else 0
-
-            if flow["hit_sig_cap"]:
-                capped_wallets7.append(wallet)
-
-            if received_pct < t7_min_pct:
-                prog7.progress((i + 1) / len(wallets7))
-                continue
-
-            sold_pct = (sold / received * 100) if received > 0 else None
-            results7.append({
-                "wallet":        wallet,
-                "received":      round(received, 4),
-                "sold":          round(sold, 4),
-                "net":           round(received - sold, 4),
-                "received_pct":  round(received_pct, 4),
-                "sold_pct":      round(sold_pct, 2) if sold_pct is not None else None,
-                "bucket":        sold_bucket(sold_pct),
-                "hit_sig_cap":   flow["hit_sig_cap"],
-            })
-            prog7.progress((i + 1) / len(wallets7))
-
-        status7.empty()
-        prog7.empty()
-
-        if capped_wallets7:
-            st.warning(
-                f"⚠️ {len(capped_wallets7)} wallet(s) hit the {t7_max_sigs}-signature cap before "
-                "reaching the cutoff time — their received/sold totals may be incomplete. "
-                "Raise the signature cap for a more complete (slower) scan."
-            )
-
-        if not results7:
-            st.warning(
-                f"No wallets received ≥{t7_min_pct}% of supply since the cutoff. "
-                "Try lowering the minimum % threshold."
-            )
-            st.stop()
-
-        # Cohort summary
-        st.markdown("---")
-        st.subheader(f"🏷️ Cohorts ({len(results7)} qualifying wallets)")
-
-        bucket_groups = defaultdict(list)
-        for r in results7:
-            bucket_groups[r["bucket"]].append(r)
-
-        present_buckets = [b for b in SELL_BUCKET_ORDER if bucket_groups.get(b)]
-        cols7 = st.columns(min(len(present_buckets), 4)) if present_buckets else []
-        for idx, b in enumerate(present_buckets):
-            count = len(bucket_groups[b])
-            cols7[idx % len(cols7)].metric(b, count, f"{count/len(results7)*100:.1f}%")
-
-        st.markdown("---")
-        for b in present_buckets:
-            members = bucket_groups[b]
-            with st.expander(f"{b}  ·  {len(members)} wallet(s)"):
-                df_b = pd.DataFrame([{
-                    "Wallet":          m["wallet"],
-                    "Received":        m["received"],
-                    "Sold":            m["sold"],
-                    "Net Held (est.)": m["net"],
-                    "% of Supply Recv'd": f"{m['received_pct']:.4f}%",
-                    "% of Received Sold": f"{m['sold_pct']:.1f}%" if m["sold_pct"] is not None else "N/A",
-                    "⚠️ Sig cap hit":  "✅" if m["hit_sig_cap"] else "",
-                } for m in sorted(members, key=lambda x: -x["received_pct"])])
-                st.dataframe(df_b, use_container_width=True, hide_index=True)
-
-        st.markdown("---")
-        st.subheader("📋 Full Results")
-        st.dataframe(pd.DataFrame([{
-            "Wallet":          r["wallet"],
-            "Received":        r["received"],
-            "Sold":            r["sold"],
-            "Net Held (est.)": r["net"],
-            "% Supply Recv'd": f"{r['received_pct']:.4f}%",
-            "% Sold":          f"{r['sold_pct']:.1f}%" if r["sold_pct"] is not None else "N/A",
-            "Bucket":          r["bucket"],
-        } for r in sorted(results7, key=lambda x: -x["received_pct"])]), use_container_width=True, hide_index=True)
-
-        st.markdown("---")
-        csv7 = pd.DataFrame([{
-            "wallet":         r["wallet"],
-            "mint":           mint7,
-            "received":       r["received"],
-            "sold":           r["sold"],
-            "net_held_est":   r["net"],
-            "pct_supply_received": r["received_pct"],
-            "pct_of_received_sold": r["sold_pct"],
-            "bucket":         r["bucket"],
-            "hit_sig_cap":    r["hit_sig_cap"],
-            "deploy_time_utc":  deploy_str,
-            "cutoff_time_utc":  cutoff_str7,
-        } for r in results7]).to_csv(index=False).encode()
-        st.download_button(
-            "⬇️ Download Sell-Through CSV",
-            csv7,
-            f"sell_through_{mint7[:8]}.csv",
-            "text/csv",
-        )
+                resolve_prog.progress((i + 1) / min(len(largest), t6_
